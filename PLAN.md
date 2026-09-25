@@ -220,8 +220,7 @@ Every phase is done. `validation/README.md` has the numbers.
 | 7 | `validation/README.md`, `tools/evaluate.py` | Held-out test set against Lyra, losses, agreement, CPU, memory and delay. |
 
 Open items:
-- **The weights' licence.**
-- **This library's own licence.**
+- **The weights' licence.** (The library's own code is MIT, `LICENSE`.)
 - **Running on arm64.** The NEON kernels compile but no arm64 hardware was
   available, so `ctest` still has to be run on a Pi, with the Pi timings
   measured there. The current figures are estimates.

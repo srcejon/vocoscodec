@@ -34,7 +34,10 @@ and the decisions made.
   - LibriSpeech (CC BY 4.0; Panayotov et al., ICASSP 2015);
   - CMU ARCTIC (Copyright Carnegie Mellon University).
   - `testdata/golden.bin` contains 1.6 s of LibriSpeech test-clean 1089-134686-0000.
-- **This library's own licence:** not chosen yet.
+- **This library** (its code, build files, tools and documentation): MIT, see
+  `LICENSE`. The MIT licence does not extend to the model files in `model/`:
+  they are converted from the EnCodec and Vocos weights and carry those
+  weights' terms, as above.
 
 ## Building
 

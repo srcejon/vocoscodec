@@ -22,5 +22,5 @@ if(VOCOSCODEC_BUILD_TESTS)
 endif()
 add_subdirectory(vocoscodec)
 
-install(FILES README.md
+install(FILES LICENSE README.md
   DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/vocoscodec")
