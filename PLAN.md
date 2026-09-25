@@ -101,6 +101,38 @@ that Angel61 can adopt it as a new codec family.
    files, README history and Meta's release notes. Vocos code and weights are
    MIT. SDRangel is GPL v3: a non-commercial weights licence (e.g. CC-BY-NC)
    would make this unusable, so stop and report if that is the answer.
+   **Result (2026-09-25): blocked, the weights' licence is unresolved.**
+   - The checkpoint `encodec_24khz-d7cc33bc.th` is served from
+     `dl.fbaipublicfiles.com/encodec/v0/`. It was published with the first
+     release in October 2022, when the README said "This repository is released
+     under the CC-BY-NC 4.0 license". The installed PyPI package, `encodec`
+     0.1.1, still ships that LICENSE and declares
+     `License: Creative Commons Attribution-NonCommercial 4.0 International`.
+   - Commit 349b72939f (2023-04-26, "Releasing under the MIT license")
+     replaced LICENSE with MIT. It changed the README to "The *code* in this
+     repository is released under the MIT license". It says nothing about the
+     weights.
+   - Issues #1 (2023-05 and 2023-06), #49 (2023-06-08) and #69 (2023-08-14,
+     "Are the weights CC-NC or MIT?") ask whether the weights are MIT too.
+     None has had an answer from Meta; #69 has no comments.
+   - The Hugging Face card `facebook/encodec_24khz` declares no licence.
+   - AudioCraft, the successor from the same authors, licenses code MIT and
+     weights CC-BY-NC 4.0 separately (README, `LICENSE_weights`).
+   - `charactr/vocos-encodec-24khz` is tagged MIT. Its checkpoint contains
+     `feature_extractor.codebook_weights` (16384 x 128), and these are bit-identical
+     to EnCodec's 16 codebooks. So a third party has relabelled Meta's
+     codebooks as MIT, but it cannot grant Meta's rights. The encoder weights
+     come only from Meta.
+
+   The only licence the weights were ever explicitly covered by is
+   CC-BY-NC 4.0, and the relicensing was scoped to code. The options were:
+   - get a written statement from Meta;
+   - accept the risk and proceed;
+   - switch to a codec whose weights are clearly licensed.
+
+   **Decision (Jon Beniston, 2026-09-25): accept the risk and proceed.** The
+   README must state the weights' provenance and this open question.
+
 1. **Reference and test vectors.** A Python reference (from `tools/reference/`)
    that runs frame by frame exactly as the C++ will, including the chosen
    lookahead and loss handling. Golden vectors: PCM in, indices out; indices
@@ -113,6 +145,52 @@ that Angel61 can adopt it as a new codec family.
    port proves impractical; OpenCV dnn is not recommended (it misdecoded Lyra's
    quantised graphs and the Windows OpenCV package is a CUDA build). Decide
    early and write the reasons down.
+
+   **Decision (2026-09-25): hand-written C++, no ML runtime.** The reasons:
+   - **Few operations.** The networks use about ten kinds, and each is a
+     short kernel. `kernels.h` has two matrix kernels (a dot-product form
+     and an output-vectorised GEMM form), ELU, GELU and an inverse FFT. They
+     run on x86-64 as AVX2+FMA+F16C, or else SSE4.2 (chosen at run time
+     after a CPUID check), as NEON on arm64, or as portable C++.
+   - **Streaming state is explicit.** Convolution histories, LSTM state and
+     the decoder's cached layers are plain arrays. ONNX would need
+     state-in/state-out graphs, as Lyra did, and cannot express the
+     decoder's partial recomputation (below) without one graph per
+     edge case.
+   - **No dependency.** Nothing to build per platform for the Pi and Android.
+     Lyra's OpenCV experience shows the runtime itself is a risk.
+   - **Numerics under control.** The C++ equals the Python reference: 100% of
+     encoder indices, decoder 101 to 111 dB SNR (`vocoscodec_golden_test`).
+
+   No prototype was needed. The port was the prototype, and it met the
+   reference on first build. Measured costs are in `validation/README.md`.
+
+   **Decoder lookahead (a Phase 1 finding that changed Phase 4).** Vocos
+   is not causal: each of its nine k=7 convolutions looks 3 frames ahead.
+   Two ways to bound that were measured (`tools/reference/decoder_lookahead.py`,
+   dev set, 20 files, mean PESQ-WB over 1.5k/3k/6k; full Vocos 2.655):
+   - **A per-layer budget:** each layer's future taps are masked, and each
+     layer computes each frame once, as cheap as the original. It scores
+     1.95 at 3 frames and 2.45 at 9 frames. Rejected.
+   - **Truncating the input:** decode as if the signal ended L frames
+     ahead. It scores 2.23 at L=0, 2.52 at L=1, 2.60 at L=2 and L=3, and
+     2.64 at L=6. Chosen, with L=3 by default.
+
+   The truncation needs each layer's values near the edge recomputed when
+   the edge moves. The decoder keeps every value that no longer depends on
+   the edge. It costs 75.7 ConvNeXt block evaluations per frame with one
+   packet per call, against 8 for the original. With packets given in groups
+   (Angel61 delivers a radio frame at once), frames early in a group see up
+   to the group's end: 17.6 blocks per frame for groups of 9.
+
+   **Half-precision weights.** Encoding frame by frame is bound by memory
+   bandwidth: the LSTM's 16.8 MB of weights are read once per frame. The
+   layers read once per frame are therefore held as IEEE half in memory.
+   These are the encoder's LSTM, down3 and conv_out, and the decoder's
+   linear layers. Measured on 6 dev files, this changed 0.6% of encoder
+   indices and did not change decoder PESQ (2.937 either way). It halves
+   those layers' memory and traffic. The files stay float32, and the
+   `VOCOSCODEC_HALF_WEIGHTS` CMake option (default ON) turns it off.
 3. **Encoder port + converter**, verified against the golden vectors: index
    agreement (expect near 100%, not exact: float differences can flip nearest
    neighbours, as with Lyra) and decoded-audio quality equal to the reference.
@@ -125,6 +203,29 @@ that Angel61 can adopt it as a new codec family.
    useful) against Lyra at matching rates on a larger speech set than two
    clips (ask before downloading any dataset), CPU, memory, delay, the
    bandwidth-embedding rule, cross-platform index agreement.
+
+## Status (2026-09-25)
+
+Every phase is done. `validation/README.md` has the numbers.
+
+| Phase | Where | Result |
+|---|---|---|
+| 0 | above | Weights' licence unresolved; the risk was accepted. |
+| 1 | `tools/reference/`, `testdata/golden.bin` | Frame-by-frame reference, checked against the upstream packages. Golden vectors for the encoder, packets, decoder (per lookahead and grouping) and losses. |
+| 2 | above | Hand-written C++; AVX2, SSE4.2, NEON and portable kernels. |
+| 3 | `vocoscodec/encoder.*`, `tools/convert_models.py` | Deterministic converter. 100% index agreement with the reference. |
+| 4 | `vocoscodec/decoder.*` | Truncated-context streaming with cached layers. 101 to 111 dB SNR against the reference. |
+| 5 | `vocoscodec/concealment.*` | Repeat, then crossfade to comfort noise or silence. R/F chosen on the dev set. |
+| 6 | `vocoscodec/c_api.*`, CMake, `vocoscodec/tests/`, `vocoscodec/tools/` | C ABI 1, install and package config, 7 ctest tests. Built and tested on Windows (MSVC) and Linux x64 (GCC 13). The Android arm64 build compiles. |
+| 7 | `validation/README.md`, `tools/evaluate.py` | Held-out test set against Lyra, losses, agreement, CPU, memory and delay. |
+
+Open items:
+- **The weights' licence.**
+- **This library's own licence.**
+- **Running on arm64.** The NEON kernels compile but no arm64 hardware was
+  available, so `ctest` still has to be run on a Pi, with the Pi timings
+  measured there. The current figures are estimates.
+- **Whether the 70 MB of model files go in git.**
 
 ## Integration notes for later (not this task)
 
