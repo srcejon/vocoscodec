@@ -75,7 +75,8 @@ checkpoints. It needs only torch; weight norm and layer scale are folded. The
 checkpoints come from `pip install encodec vocos` followed by
 `EncodecModel.encodec_model_24khz()` and
 `Vocos.from_pretrained("charactr/vocos-encodec-24khz")`, which download them.
-The model files are not kept in git (70 MB).
+The model files are in `model/` (70 MB); rerunning the converter reproduces
+them bit for bit (`model/SHA256SUMS`).
 
 | File | Contents | Size | SHA-256 |
 |---|---|---|---|

@@ -225,7 +225,6 @@ Open items:
 - **Running on arm64.** The NEON kernels compile but no arm64 hardware was
   available, so `ctest` still has to be run on a Pi, with the Pi timings
   measured there. The current figures are estimates.
-- **Whether the 70 MB of model files go in git.**
 
 ## Integration notes for later (not this task)
 
