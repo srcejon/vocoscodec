@@ -1,4 +1,8 @@
-"""Write a listening comparison of vocoscodec and Lyra to build/listening.
+"""Write listening comparisons to build/listening.
+
+`listening.py` writes index.html, vocoscodec against Lyra. `listening.py --dstar`
+writes dstar.html, vocoscodec 2.25k against AMBE (D-STAR) at 2.4 kbit/s, from
+mbevocoder and with every version level-matched (see dstar_page).
 
 For a few test-set utterances, writes 16 kHz WAVs of:
 - the original;
@@ -24,10 +28,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from scipy.signal import resample_poly
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import evaluate as ev  # noqa: E402
 from evaluate import common  # noqa: E402
+from prepare_corpus import active_level_db  # noqa: E402
 
 OUT = ev.ROOT / "build" / "listening"
 CLIPS = ["ls_8463-287645-0000", "ls_5105-28233-0000", "ls_1998-15444-0001",
@@ -135,5 +141,95 @@ rate, and is shown. Headphones recommended.</p>
     (OUT / "index.html").write_text(page, encoding="utf-8", newline="\n")
 
 
+# Chosen from the per-file scores of evaluate.py narrowband, by the gap in PESQ
+# between vocoscodec 2.25k and D-STAR: near zero, then each codec's largest.
+DSTAR_CLIPS = [("ls_5105-28233-0001", "Typical, male"),
+               ("ls_4446-2271-0001", "Typical, female"),
+               ("ls_4198-12259-0000", "D-STAR's largest win"),
+               ("ls_1688-142285-0000", "D-STAR's largest win from another speaker"),
+               ("ls_3331-159605-0001", "vocoscodec's largest win"),
+               ("arctic_clb_b0001", "vocoscodec's largest win from another speaker")]
+
+
+def up2(x):
+    return resample_poly(x, 2, 1).astype(np.float32)
+
+
+def dstar_page():
+    """Six clips, each version at 16 kHz and at the original's active speech level.
+
+    vocoscodec also appears limited to 4 kHz, so that its quality can be judged
+    apart from its bandwidth. Scores are those of `evaluate.py narrowband`."""
+    results = json.loads((ev.OUT / "narrowband.json").read_text())
+    clean = [r for r in results if "loss" not in r]
+    dstar = next(r for r in clean if r.get("mbe") == "dstar")["files"]
+    voc = next(r for r in clean if r.get("codebooks") == 3)["files"]
+    scores = {"dstar": {f["file"]: f for f in dstar}, "voc": {f["file"]: f for f in voc}}
+    items = {i["name"]: i for i in ev.prepare("test")}
+    index = {e["file"][:-4]: e
+             for e in json.loads((common.CORPUS / "test" / "INDEX.json").read_text())}
+    OUT.mkdir(parents=True, exist_ok=True)
+    (ev.OUT / "work").mkdir(parents=True, exist_ok=True)
+    sections = []
+    for name, why in DSTAR_CLIPS:
+        item = items[name]
+        reference, _ = common.read_wav(item["reference"])
+        y8 = ev.mbe_decode(item, "dstar", None, str(ev.OUT / "work"), name)
+        y8 = y8[ev.MBE_DELAY["dstar"]:]
+        voc16, _ = vocos(item, 3)
+        target = active_level_db(reference)
+        versions = [("Original", "original", reference),
+                    ("Original, limited to 4 kHz", "original_4k", up2(ev.down2(reference))),
+                    ("AMBE (D-STAR), 2400 bit/s", "dstar", up2(y8)),
+                    ("vocoscodec 2.25k, limited to 4 kHz", "vocoscodec_4k", up2(ev.down2(voc16))),
+                    ("vocoscodec 2.25k", "vocoscodec", voc16)]
+        rows = []
+        for label, slug, audio in versions:
+            audio = np.pad(audio, (0, max(0, len(reference) - len(audio))))[:len(reference)]
+            audio = audio * 10 ** ((target - active_level_db(audio)) / 20)
+            filename = f"dstar_{name}__{slug}.wav"
+            common.write_wav(OUT / filename, audio, 16000)
+            rows.append(f"<tr><td>{html.escape(label)}</td><td><audio controls preload=none "
+                        f"src=\"{embed(filename)}\"></audio></td></tr>")
+            (OUT / filename).unlink()
+        d, v = scores["dstar"][name], scores["voc"][name]
+        sections.append(
+            f"<h2>{html.escape(why)}</h2>\n<p>{html.escape(index[name]['origin'])}, "
+            f"{index[name]['sex']}, {index[name]['seconds']} s. PESQ: D-STAR {d['pesq_nb']:.2f}, "
+            f"vocoscodec {v['pesq_nb']:.2f}. ESTOI: D-STAR {d['estoi']:.3f}, vocoscodec "
+            f"{v['estoi']:.3f}. PESQ-WB: D-STAR {d['pesq']:.2f}, vocoscodec {v['pesq']:.2f}.</p>\n"
+            f"<table>{''.join(rows)}</table>")
+        print(name, why)
+    page = f"""<!doctype html>
+<html lang=en><head><meta charset=utf-8><title>D-STAR and vocoscodec</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 2em auto; max-width: 52em; padding: 0 1em; }}
+table {{ border-collapse: collapse; margin-bottom: 1.5em; }}
+td {{ padding: 0.2em 0.8em; }}
+tr:nth-child(even) {{ background: #f2f2f2; }}
+audio {{ height: 2em; }}
+</style></head><body>
+<h1>AMBE (D-STAR) and vocoscodec 2.25k</h1>
+<p>Six test-set clips, chosen from the per-file PESQ gap, not by ear: two where the codecs
+tie, and each codec's two largest wins. Across all 32 test files the mean scores are PESQ 2.95
+D-STAR and 2.96 vocoscodec, and ESTOI 0.827 and 0.803.</p>
+<p>D-STAR is mbevocoder's AMBE encoder and decoder at 2400 bit/s of voice (3600 on air, with
+FEC), fed 8 kHz speech. vocoscodec is 2250 bit/s, lookahead 3, one packet per call, fed
+wideband speech. There are no channel errors, and the speech is clean. Every version here is
+at the original's active speech level, so that loudness doesn't decide the comparison.
+The "limited to 4 kHz" versions let you compare quality apart from bandwidth.
+Headphones recommended.</p>
+<p>Speech: LibriSpeech (CC BY 4.0) and CMU ARCTIC (Copyright Carnegie Mellon University).</p>
+{chr(10).join(sections)}
+</body></html>
+"""
+    (OUT / "dstar.html").write_text(page, encoding="utf-8", newline="\n")
+    print(f"-> {OUT / 'dstar.html'}")
+
+
 if __name__ == "__main__":
-    main()
+    if "--dstar" in sys.argv[1:]:
+        sys.argv = sys.argv[:1]
+        dstar_page()
+    else:
+        main()

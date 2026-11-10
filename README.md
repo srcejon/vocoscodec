@@ -1,20 +1,89 @@
 # vocoscodec
 
 A speech codec made of the EnCodec 24 kHz encoder and the Vocos decoder, as a
-standalone C++ library with a stable C ABI, for SDRangel's Angel61 digital
+standalone C++ library with a C ABI, for SDRangel's Angel61 digital
 voice protocol. It needs no Python, PyTorch or ML runtime: the networks run
 in hand-written C++ (AVX2/FMA/F16C or else SSE4.2 on x86-64, NEON on arm64, portable C++
 elsewhere).
 
-On a held-out set of 32 utterances from 16 speakers, it scores PESQ-WB:
-- 2.33 at 2.25 kbit/s, equal to Lyra at 3.2 kbit/s;
-- 2.59 at 3.0 kbit/s;
-- 3.08 at 6 kbit/s, against 2.93 for Lyra at 6 kbit/s;
-- 3.23 at 9 kbit/s, against 3.17 for Lyra at 9.2 kbit/s.
+## Comparison with mbevocoder and Lyra
 
-`validation/README.md` has the measurements: quality against Lyra, losses,
-agreement, CPU, memory and delay. `PLAN.md` records why the codec was built
-and the decisions made.
+[mbevocoder](https://github.com/srcejon/mbevocoder) implements AMBE, AMBE+2 and
+IMBE, the vocoders of D-STAR, DMR, P25 and other digital voice systems. They run
+at an 8 kHz sample rate, so they carry speech up to 4 kHz.
+[Lyra](https://github.com/google/lyra) is Google's neural speech codec. On a
+held-out set of 32 16 kHz recordings from 16 speakers, every codec was scored
+against the original speech: PESQ and ESTOI at an 8 kHz sample rate, and PESQ-WB
+and WARP-Q at 16 kHz:
+
+| Codec            | Voice bit/s | PESQ     | ESTOI     | PESQ-WB  | WARP-Q    |
+|------------------|-------------|----------|-----------|----------|-----------|
+| vocoscodec 1.5k  | 1500        | 2.46     | 0.757     | 1.88     | 0.324     |
+| vocoscodec 2.25k | 2250        | **2.96** | 0.803     | **2.33** | 0.396     |
+| AMBE (D-STAR)    | 2400        | **2.95** | **0.827** | 2.05     | 0.393     |
+| AMBE+2 (DMR, P25p2, YSF DN, NXDN) | 2450 | 2.90 | 0.818 | 2.05 | **0.421** |
+| vocoscodec 3.0k  | 3000        | **3.16** | **0.835** | **2.59** | **0.427** |
+| Lyra 3.2k        | 3200        | 2.90     | 0.797     | 2.33     | 0.417     |
+| IMBE (P25p1, YSF VW, NXDN) | 4400 | 3.03  | 0.833     | 1.99     | 0.400     |
+| vocoscodec 4.5k  | 4500        | **3.36** | **0.863** | **2.82** | **0.462** |
+| Lyra 6k          | 6000        | 3.41     | 0.853     | 2.93     | 0.481     |
+| vocoscodec 6k    | 6000        | **3.56** | **0.881** | **3.08** | **0.492** |
+| vocoscodec 9k    | 9000        | **3.68** | **0.898** | **3.23** | **0.521** |
+| Lyra 9.2k        | 9200        | 3.59     | 0.874     | 3.17     | 0.500     |
+| vocoscodec 12k   | 12000       | 3.78     | 0.909     | 3.39     | 0.542     |
+
+Higher is better on all four measures:
+
+- **PESQ** (ITU-T P.862) predicts how listeners would rate the decoded speech
+  against the original, from 1 (bad) to 4.5 (excellent). This is its narrowband
+  form, which covers speech up to 4 kHz.
+- **PESQ-WB** (ITU-T P.862.2) is the wideband form, covering speech up to 8 kHz,
+  so it marks down a codec that stops at 4 kHz. Its scores can't be compared
+  directly with narrowband PESQ.
+- **ESTOI** (extended short-time objective intelligibility) predicts how
+  intelligible the speech is, from 0 to 1, by measuring how much of the
+  original's short-time spectral structure survives. It only analyses up to
+  about 4.3 kHz, whatever the sample rate, so it gives almost no credit for
+  bandwidth above that.
+- **[WARP-Q](https://github.com/wjassim/WARP-Q)** predicts quality from how
+  closely the decoded speech's MFCCs can be time-aligned to the original's. It
+  was designed for low-rate neural codecs, whose output can sound right without
+  matching the waveform. Scores here are its normalised form, in which the
+  original against itself scores 0.83, not 1. It analyses up to 5 kHz by
+  default, so it gives no credit for bandwidth above that, but marks down a
+  codec that stops at 4 kHz: the original limited to 4 kHz scores only 0.63,
+  which counts against the MBE codecs. With both signals limited to 4 kHz, AMBE
+  scores 0.438 and AMBE+2 0.466, against 0.422 for vocoscodec 2.25k and 0.453
+  for 3.0k.
+
+What the results show:
+
+- **At about 2.4 kbit/s, MBE holds its own.** vocoscodec 2.25k ties AMBE and
+  AMBE+2 on PESQ, and is significantly behind them on ESTOI, which tracks
+  intelligibility. Its advantage there is bandwidth: PESQ-WB 2.33 against 2.05,
+  because MBE stops at 4 kHz.
+- **At 3.0 kbit/s, vocoscodec leads.** It beats AMBE+2 at 2.45 kbit/s and IMBE
+  at 4.4 kbit/s on PESQ, by 0.26 and 0.13, and matches or beats them on ESTOI.
+- **At 4.5 kbit/s, vocoscodec is clearly ahead of IMBE** on PESQ and ESTOI, by
+  0.33 and 0.030.
+- **Against Lyra, vocoscodec reaches the same quality at a lower rate.** Its
+  2.25k ties Lyra 3.2k, and from 3.0k it is ahead at every rate. It leads Lyra
+  3.2k by 0.26 on PESQ at 3.0k, Lyra 6k by 0.15 at 6k, and Lyra 9.2k by 0.10 at
+  9k, and it wins on ESTOI on all 32 files at each of these rates.
+- **Under packet loss,** vocoscodec 3.0k stays ahead of AMBE+2 2450 at up to 10%
+  random loss and at every level of radio-frame loss. At 20% bursts they tie. It
+  also leads Lyra 3.2k, except at 10% and 20% bursts, where Lyra is ahead by
+  0.02 and 0.06.
+- **MBE's voice rates exclude its FEC:** AMBE and AMBE+2 are 3600 bit/s on air,
+  IMBE 7200. vocoscodec and Lyra carry no FEC of their own, so the protocol's
+  FEC adds to their rates in the same way. Bit errors were not compared.
+- **MBE is far cheaper.** It needs no models (vocoscodec holds 41 MB in memory)
+  and about 1.6% of a core to encode and 0.05% to decode, against about 7% and
+  3%. Its delay is 85 ms (91 ms for AMBE at D-STAR), against 73 ms.
+
+`validation/README.md` has the measurements: quality against Lyra and
+mbevocoder, losses, agreement, CPU, memory and delay. `PLAN.md` records why the
+codec was built and the decisions made.
 
 ## Licences and provenance
 
@@ -25,9 +94,6 @@ and the decisions made.
   - The 2023 relicensing says "the code". Meta has not answered the public
     questions about whether the weights are MIT too (encodec issues #1, #49,
     #69).
-  - The owner accepted this risk on 2026-09-25 (PLAN.md, phase 0).
-  - Anyone redistributing the model files should know that the question is
-    open.
 - **Vocos** (`charactr/vocos-encodec-24khz`), code and weights: MIT. Its
   embedding table is EnCodec's first 16 codebooks, bit for bit.
 - **The test and validation speech** is not stored here:

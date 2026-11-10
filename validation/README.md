@@ -66,6 +66,129 @@ The loss comes from the lookahead of 3 frames (60 ms of decoder delay).
 Groups of packets, as Angel61 delivers them, recover about half of it (next
 section).
 
+## Against mbevocoder (test set)
+
+[mbevocoder](https://github.com/srcejon/mbevocoder) (commit `c6e08b6`, default
+encoder options) implements the 8 kHz vocoders AMBE (D-STAR), AMBE+2 and IMBE.
+`tools/evaluate.py narrowband` reproduces this section. It runs mbevocoder's
+`mbe-cli` as a separate program and links none of its code.
+
+- **Input:** each codec gets the speech as it would in use, from the same 32
+  files: MBE at 8 kHz, Lyra at 16 kHz, vocoscodec at 24 kHz.
+- **Scoring:** narrowband PESQ and ESTOI at 8 kHz against the original, which
+  are the measures mbevocoder reports, and PESQ-WB at 16 kHz. The wideband
+  codecs' output is resampled to 8 kHz, and MBE's to 16 kHz.
+- **Alignment:** MBE's delay is removed as a constant, 520 samples at 8 kHz
+  (570 for D-STAR). Those are where mean ESTOI peaks over 11 test-set files, and
+  the 50-sample difference matches `mbe_encoderDelaySamples`.
+- **Rates:** voice payload. MBE's on-air rates include FEC (3600 bit/s for AMBE
+  and AMBE+2, 7200 for IMBE). vocoscodec and Lyra have no FEC of their own.
+
+| Codec | Voice bit/s | PESQ | ESTOI | PESQ-WB |
+|---|---:|---:|---:|---:|
+| vocoscodec, 2 codebooks | 1500 | 2.46 | 0.757 | 1.88 |
+| vocoscodec, 3 codebooks | 2250 | 2.96 | 0.803 | 2.33 |
+| AMBE (D-STAR) | 2400 | 2.95 | 0.827 | 2.05 |
+| AMBE+2 | 2450 | 2.90 | 0.818 | 2.05 |
+| vocoscodec, 4 codebooks | 3000 | 3.16 | 0.835 | 2.59 |
+| Lyra | 3200 | 2.90 | 0.797 | 2.33 |
+| IMBE | 4400 | 3.03 | 0.833 | 1.99 |
+| vocoscodec, 6 codebooks | 4500 | 3.36 | 0.863 | 2.82 |
+| Lyra | 6000 | 3.41 | 0.853 | 2.93 |
+| vocoscodec, 8 codebooks | 6000 | 3.56 | 0.881 | 3.08 |
+| vocoscodec, 12 codebooks | 9000 | 3.68 | 0.898 | 3.23 |
+| Lyra | 9200 | 3.59 | 0.874 | 3.17 |
+| vocoscodec, 16 codebooks | 12000 | 3.78 | 0.909 | 3.39 |
+
+Paired differences over the 32 files, with the standard error, the files won
+and a Wilcoxon signed-rank p:
+
+| Comparison | PESQ | Won | p | ESTOI | Won | p |
+|---|---:|---:|---:|---:|---:|---:|
+| vocoscodec 2.25k − AMBE+2 | +0.05 ± 0.06 | 20 | 0.16 | −0.015 ± 0.006 | 7 | 0.004 |
+| vocoscodec 2.25k − AMBE | +0.00 ± 0.06 | 19 | 0.76 | −0.024 ± 0.005 | 6 | 0.0001 |
+| vocoscodec 3.0k − AMBE+2 | +0.26 ± 0.06 | 27 | 0.0001 | +0.017 ± 0.005 | 25 | 0.0003 |
+| vocoscodec 3.0k − AMBE | +0.21 ± 0.06 | 25 | 0.002 | +0.008 ± 0.005 | 19 | 0.06 |
+| vocoscodec 3.0k − IMBE | +0.13 ± 0.05 | 24 | 0.004 | +0.002 ± 0.004 | 18 | 0.65 |
+| vocoscodec 4.5k − IMBE | +0.33 ± 0.05 | 28 | 0.00001 | +0.030 ± 0.004 | 30 | 0.0000002 |
+| Lyra 3.2k − AMBE+2 | −0.00 ± 0.06 | 16 | 0.83 | −0.021 ± 0.005 | 3 | 0.00003 |
+| vocoscodec 2.25k − Lyra 3.2k | +0.06 ± 0.03 | 18 | 0.12 | +0.006 ± 0.004 | 19 | 0.25 |
+| vocoscodec 3.0k − Lyra 3.2k | +0.26 ± 0.03 | 28 | 0.00000003 | +0.038 ± 0.003 | 32 | 0.0000000005 |
+| vocoscodec 6k − Lyra 6k | +0.15 ± 0.03 | 24 | 0.00002 | +0.028 ± 0.002 | 32 | 0.0000000005 |
+| vocoscodec 9k − Lyra 9.2k | +0.10 ± 0.03 | 24 | 0.003 | +0.024 ± 0.002 | 32 | 0.0000000005 |
+| vocoscodec 12k − Lyra 9.2k | +0.20 ± 0.03 | 27 | 0.0000005 | +0.034 ± 0.002 | 32 | 0.0000000005 |
+
+- **Against Lyra at matching rates,** vocoscodec leads on narrowband PESQ from
+  3.0k upwards, and on ESTOI on every file. Its 2.25k and Lyra's 3.2k are not
+  significantly different on either measure, nor on PESQ-WB (2.33 each).
+- **Below 2.5 kbit/s, MBE is at least as good within 4 kHz.** vocoscodec 2.25k
+  ties it on PESQ and is significantly behind on ESTOI, on 25 or more of the 32
+  files. PESQ and ESTOI disagree here, and this report doesn't establish why.
+  Listening would be a better guide than either at this rate.
+- **From 3.0 kbit/s, vocoscodec leads on PESQ.** On ESTOI it is significantly
+  ahead of AMBE+2, not significantly different from AMBE or IMBE at 3.0k, and
+  clearly ahead of IMBE at 4.5k.
+- **PESQ-WB favours the wideband codecs by design:** MBE carries nothing above
+  4 kHz, whatever its rate, so IMBE gains nothing over AMBE on this measure.
+- **Narrowband input doesn't flatter or hurt vocoscodec.** Given the same 8 kHz
+  band-limited speech as MBE, it scores PESQ 2.98, 3.22 and 3.43 and ESTOI 0.800,
+  0.836 and 0.863 at 2.25k, 3.0k and 4.5k, within 0.07 and 0.003 of the wideband
+  input's figures.
+
+### Packet losses at 8 kHz
+
+The loss patterns are those of "Lost packets" below, three per file, and in time,
+so a 20 ms MBE or Lyra frame and a 13.3 ms vocoscodec frame lose comparable
+audio. Realised rates are within 0.5 points of nominal. Each codec uses its own
+concealment: `mbe_processLostFramef` for MBE, as measured from the AMBE-3000R.
+PESQ / ESTOI:
+
+| Loss | AMBE+2 2450 | vocoscodec 2.25k | vocoscodec 3.0k | Lyra 3.2k |
+|---|---:|---:|---:|---:|
+| none | 2.90 / 0.818 | 2.96 / 0.803 | 3.16 / 0.835 | 2.90 / 0.797 |
+| random 1% | 2.86 / 0.813 | 2.90 / 0.799 | **3.08 / 0.831** | 2.83 / 0.794 |
+| random 5% | 2.67 / 0.792 | 2.67 / 0.782 | **2.77 / 0.812** | 2.60 / 0.781 |
+| random 10% | 2.42 / 0.764 | 2.43 / 0.761 | **2.49 / 0.791** | 2.38 / 0.761 |
+| random 20% | 2.07 / 0.704 | 2.06 / 0.717 | **2.11 / 0.745** | 2.02 / 0.717 |
+| burst 1% | 2.83 / 0.811 | 2.86 / 0.797 | **3.04 / 0.828** | 2.81 / 0.791 |
+| burst 5% | 2.50 / 0.780 | 2.52 / 0.771 | **2.65 / 0.801** | 2.51 / 0.765 |
+| burst 10% | 2.19 / 0.741 | 2.15 / 0.730 | 2.23 / 0.758 | **2.25** / 0.738 |
+| burst 20% | 1.79 / 0.674 | 1.74 / 0.664 | 1.79 / 0.690 | **1.85** / 0.680 |
+| radio frame 5% | 2.44 / 0.773 | 2.55 / 0.761 | **2.69 / 0.791** | 2.53 / 0.758 |
+| radio frame 10% | 2.08 / 0.721 | 2.18 / 0.710 | **2.28 / 0.738** | 2.18 / 0.709 |
+| radio frame 20% | 1.65 / 0.633 | 1.77 / 0.626 | **1.83 / 0.652** | 1.80 / 0.626 |
+
+- **vocoscodec 3.0k** leads AMBE+2 under every random and radio-frame loss, and
+  ties it at 20% bursts.
+- **vocoscodec 2.25k** ties AMBE+2 under random and burst losses, and beats it
+  on PESQ when whole 240 ms radio frames are lost.
+- **These are lost packets, not bit errors.** MBE's FEC corrects bit errors
+  before a frame is lost, and these figures give it no credit for that. Packet
+  losses are the fair common ground, since Angel61's own FEC would protect
+  vocoscodec.
+
+### Cost
+
+One performance core pinned, as in "CPU, memory and delay" below. mbevocoder's
+own `mbevocoder-bench` on the test set, 60 s, three runs, per 20 ms frame:
+
+| | Encode | Decode | Model memory | Delay |
+|---|---:|---:|---:|---:|
+| AMBE+2 | 0.31 ms (1.5%) | 0.009 ms (0.05%) | none | 85 ms |
+| AMBE (D-STAR) | 0.32 ms (1.6%) | 0.009 ms (0.05%) | none | 91 ms |
+| IMBE | 0.33 ms (1.7%) | 0.009 ms (0.05%) | none | 85 ms |
+| vocoscodec 3.0k, 9 per call | 0.92 ms per 13.3 ms (6.9%) | 0.41 ms per 13.3 ms (3.1%) | 41 MB | 73 ms |
+
+MBE's delay is its measured 65 ms (71 ms for D-STAR) plus its 20 ms frame.
+vocoscodec's is 60 ms plus its 13.3 ms frame, as below.
+
+These were not measured together. The mbevocoder figures are from 2026-11-05 at
+about 11% machine load, and the vocoscodec ones from the quiet-machine benchmark
+of 2026-09-25 below. On 2026-11-05, with other work loading the machine to 40-85%,
+vocoscodec took 1.4-1.8 ms to encode and 0.54 ms to decode at 9 per call. Its
+timings rose with the load, as memory-bound code does, and its code had not
+changed, but no quiet window came up to confirm the earlier figures.
+
 ## Decoder lookahead (dev set)
 
 | Codebooks | L=0 | L=1 | L=2 | **L=3** | L=6 | L=27 (unbounded) | L=3, 9 per call | L=3, 18 per call |

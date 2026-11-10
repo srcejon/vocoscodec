@@ -5,6 +5,8 @@ Subcommands (results as JSON in build/eval, tables on stdout):
   bandwidth     dev set: which Vocos bandwidth embedding suits each codebook count
   lookahead     dev set: decoder lookahead and packets per call
   quality       test set: rates, losses and Lyra at matching rates (validation/README.md)
+  narrowband    test set: against mbevocoder (AMBE+2, AMBE, IMBE) and Lyra, at 8 kHz
+  osr           the same on mbevocoder's 8 kHz Open Speech Repository recordings
 
 Build first (build.bat Release). Inputs come from tools/prepare_corpus.py.
 Each 16 kHz file is resampled to 24 kHz (scipy polyphase), encoded once at
@@ -25,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+from scipy.signal import resample_poly
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "reference"))
 import common  # noqa: E402
@@ -95,6 +98,9 @@ def lyra():
     global _lyra
     if _lyra is None:
         import ctypes
+        # This OpenCV is a CUDA build that needs cuDNN, even though Lyra runs on the CPU.
+        for found in sorted(Path(r"C:\Program Files\NVIDIA\CUDNN").glob("*/bin/*/x64/cudnn64_9.dll")):
+            os.environ["PATH"] = f"{found.parent}{os.pathsep}{os.environ['PATH']}"
         lib = ctypes.CDLL(str(LYRA_DLL), winmode=0)  # standard search: OpenCV via PATH
         lib.lyracodec_encoder_create.restype = ctypes.c_void_p
         lib.lyracodec_decoder_create.restype = ctypes.c_void_p
@@ -125,6 +131,53 @@ def lyra_decode(x16: np.ndarray, bitrate: int, lost: np.ndarray | None) -> np.nd
     return np.concatenate(out)
 
 
+# ---------------------------------------------------------------- mbevocoder, for comparison
+
+# github.com/srcejon/mbevocoder, built with mbe-cli; it is run, not linked.
+MBE_CLI = Path(os.environ.get("MBE_CLI", ROOT / "build" / "mbevocoder" / "build-release" /
+                              "tools" / "mbe-cli" / "mbe-cli.exe"))
+# Voice bit/s and on-air bit/s with FEC.
+MBE_RATES = {"dstar": (2400, 3600), "ambe2450": (2450, 3600), "imbe4400": (4400, 7200)}
+# Encoder input to decoder output in samples at 8 kHz, measured: mean ESTOI peaks
+# here over 11 test-set files (D-STAR 50 later, as mbe_encoderDelaySamples says).
+MBE_DELAY = {"dstar": 570, "ambe2450": 520, "imbe4400": 520}
+MBE_FRAME = 160
+
+
+def mbe_decode(item, rate: str, lost: np.ndarray | None, work: str, tag: str) -> np.ndarray:
+    """8 kHz input -> encoder -> frames (cached) -> decoder; `lost` frames concealed."""
+    frames = Path(item["packets"]).with_suffix(f".{rate}.dvsi")
+    if not frames.exists():
+        wav8 = Path(item["input8"]) if "input8" in item else Path(work) / f"{tag}_in.wav"
+        if "input8" not in item:
+            x16, _ = common.read_wav(item["reference"])
+            common.write_wav(wav8, down2(x16), 8000)
+        temporary = Path(work) / f"{tag}.dvsi"
+        subprocess.run([str(MBE_CLI), "encode", "--rate", rate, str(wav8), str(temporary)],
+                       check=True, capture_output=True)
+        os.replace(temporary, frames)
+        if "input8" not in item:
+            wav8.unlink()
+    out = Path(work) / f"{tag}_out.wav"
+    args = [str(MBE_CLI), "decode", "--rate", rate]
+    lost_file = None
+    if lost is not None and lost.any():
+        lost_file = Path(work) / f"{tag}_lost.txt"
+        lost_file.write_text(" ".join(str(i) for i in np.nonzero(lost)[0]))
+        args += ["--lost", str(lost_file)]
+    subprocess.run(args + [str(frames), str(out)], check=True, capture_output=True)
+    y8, rate_hz = common.read_wav(out)
+    assert rate_hz == 8000
+    out.unlink()
+    if lost_file:
+        lost_file.unlink()
+    return y8
+
+
+def down2(x: np.ndarray) -> np.ndarray:
+    return resample_poly(x, 1, 2).astype(np.float32)
+
+
 # ---------------------------------------------------------------- running the codec
 
 def prepare(set_name: str) -> list[dict]:
@@ -145,7 +198,30 @@ def prepare(set_name: str) -> list[dict]:
     return items
 
 
+def score_narrowband(reference: np.ndarray, condition, result: dict, decoded16=None,
+                     decoded8=None, delay8: int = 0) -> dict:
+    """Narrowband PESQ and ESTOI at 8 kHz, as mbevocoder scores, and PESQ-WB at 16 kHz.
+
+    One of decoded16 and decoded8 is given; the other comes from resampling it.
+    `delay8` is the decoded signal's delay at 8 kHz."""
+    from pesq import pesq
+    from pystoi import stoi
+    if decoded8 is None:
+        decoded8 = down2(decoded16)
+    if decoded16 is None:
+        decoded16 = resample_poly(decoded8, 2, 1).astype(np.float32)
+    reference8 = down2(reference)
+    aligned = decoded8[delay8:]
+    n = min(len(reference8), len(aligned))
+    result["pesq_nb"] = float(pesq(8000, reference8[:n], aligned[:n], "nb"))
+    result["estoi"] = float(stoi(reference8[:n], aligned[:n], 8000, extended=True))
+    result["pesq"] = common.pesq_wb(reference, decoded16, 2 * delay8)
+    return result
+
+
 def score(reference: np.ndarray, decoded16: np.ndarray, condition, result: dict) -> dict:
+    if condition.get("narrowband"):
+        return score_narrowband(reference, condition, result, decoded16=decoded16)
     result["pesq"] = common.pesq_wb(reference, decoded16)
     if condition.get("stoi"):
         from pystoi import stoi
@@ -179,6 +255,15 @@ def decode_score_once(task) -> dict:
     """Decode one file under one condition and score it (in a pool thread)."""
     item, condition, work = task
     reference, _ = common.read_wav(item["reference"])
+    if condition.get("codec") == "mbe":
+        frames = (len(reference) // 2 + MBE_FRAME - 1) // MBE_FRAME
+        lost = loss_mask(frames, condition.get("loss", "random"), condition.get("rate", 0.0),
+                         loss_seed(item, condition), frame_ms=20.0)
+        tag = f"{item['name']}_{threading.get_ident()}"
+        y8 = mbe_decode(item, condition["mbe"], lost, work, tag)
+        return score_narrowband(reference, condition,
+                                {"file": item["name"], "lost": float(lost.mean())},
+                                decoded8=y8, delay8=MBE_DELAY[condition["mbe"]])
     if condition.get("codec") == "lyra":
         frames = (len(reference) + 319) // 320
         lost = loss_mask(frames, condition.get("loss", "random"), condition.get("rate", 0.0),
@@ -232,6 +317,9 @@ def run(items, conditions, workers=None) -> list[dict]:
                     "files": scores})
         if c.get("stoi"):
             out[-1]["stoi"] = float(np.mean([r["stoi"] for r in scores]))
+        if c.get("narrowband"):
+            out[-1]["pesq_nb"] = float(np.mean([r["pesq_nb"] for r in scores]))
+            out[-1]["estoi"] = float(np.mean([r["estoi"] for r in scores]))
     return out
 
 
@@ -404,6 +492,153 @@ def quality(args):
           f"{a[0]:.2f} {a[1]:.2f} {a[3]:.2f} {a[7]:.2f} {a[15]:.2f} %")
 
 
+def narrowband(args):
+    """mbevocoder's three codecs, vocoscodec and Lyra, on the test set, scored at 8 kHz.
+
+    Each codec gets the speech as it would in use (MBE 8 kHz, Lyra 16 kHz, vocoscodec
+    24 kHz), and all are scored against the same originals."""
+    items = prepare("test")
+    codebooks = (2, 3, 4, 6, 8, 12, 16)
+    lyra_rates = (3200, 6000, 9200)
+    clean = [{"codebooks": n, "narrowband": True} for n in codebooks]
+    clean += [{"codec": "lyra", "bitrate": b, "narrowband": True} for b in lyra_rates]
+    clean += [{"codec": "mbe", "mbe": r, "narrowband": True} for r in MBE_RATES]
+    lossy = []
+    for loss, rate in LOSS_CONDITIONS:
+        for seed in range(LOSS_SEEDS):
+            common_keys = {"loss": loss, "rate": rate, "seed": seed, "narrowband": True}
+            lossy.append({"codec": "mbe", "mbe": "ambe2450", **common_keys})
+            lossy.append({"codebooks": 3, **common_keys})
+            lossy.append({"codebooks": 4, **common_keys})
+            lossy.append({"codec": "lyra", "bitrate": 3200, **common_keys})
+    results = run(items, clean + lossy, workers=args.workers)
+    save("narrowband", results)
+
+    print(f"Test set: {len(items)} files, 8 kHz scoring")
+    print(f"{'codec':32} {'bit/s':>6}  PESQ   ESTOI  PESQ-WB")
+    rows = []
+    for r in results[:len(clean)]:
+        if r.get("codec") == "mbe":
+            rows.append((MBE_RATES[r["mbe"]][0], f"mbevocoder {r['mbe']}", r))
+        elif r.get("codec") == "lyra":
+            rows.append((r["bitrate"], "Lyra", r))
+        else:
+            rows.append((750 * r["codebooks"], f"vocoscodec {r['codebooks']} codebooks", r))
+    for bits, label, r in sorted(rows, key=lambda row: row[0]):
+        print(f"{label:32} {bits:6d}  {r['pesq_nb']:.2f}   {r['estoi']:.3f}  {r['pesq']:.2f}")
+
+    def mean(keep, key):
+        rows = [r for r in results[len(clean):] if keep(r)]
+        if key == "lost":
+            return 100 * np.mean([f["lost"] for r in rows for f in r["files"]])
+        return np.mean([r[key] for r in rows])
+
+    chains = [("AMBE+2 2450", lambda r: r.get("mbe") == "ambe2450"),
+              ("vocoscodec 2.25k", lambda r: r.get("codebooks") == 3),
+              ("vocoscodec 3.0k", lambda r: r.get("codebooks") == 4),
+              ("Lyra 3.2k", lambda r: r.get("bitrate") == 3200)]
+    print(f"\nlosses ({LOSS_SEEDS} patterns per file), narrowband PESQ, ESTOI, realised loss")
+    for loss, rate in LOSS_CONDITIONS:
+        print(f"{loss:6} {100 * rate:3.0f}%")
+        for label, keep in chains:
+            match = lambda r: keep(r) and r["loss"] == loss and r["rate"] == rate  # noqa: E731,B023
+            print(f"    {label:18} {mean(match, 'pesq_nb'):.2f}  {mean(match, 'estoi'):.3f}  "
+                  f"({mean(match, 'lost'):.1f}%)")
+
+
+def osr(args):
+    """Every codec on mbevocoder's Open Speech Repository recordings, scored at 8 kHz.
+
+    These are 8 kHz recordings (testdata/corpus of mbevocoder, 15 s each, -26 dBov), so
+    every codec gets the same band-limited speech, resampled to its own rate. There is
+    nothing above 4 kHz to score, so no PESQ-WB. Speech samples from the Open Speech
+    Repository."""
+    from pesq import pesq
+    from pystoi import stoi
+    from scipy.stats import wilcoxon
+
+    directory = OUT / "osr"
+    directory.mkdir(parents=True, exist_ok=True)
+    work = OUT / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    files = sorted(Path(args.corpus).glob("OSR_*.wav"))
+    if not files:
+        raise SystemExit(f"no OSR_*.wav in {args.corpus}")
+
+    def prepared(path):
+        packets = directory / f"{path.stem}.packets"
+        if not packets.exists():
+            x8, rate = common.read_wav(path)
+            assert rate == 8000
+            wav24 = directory / f"{path.stem}_24k.wav"
+            common.write_wav(wav24, resample_poly(x8, 3, 1).astype(np.float32), 24000)
+            subprocess.run([str(TOOLS / "vocoscodec_encode.exe"), str(common.MODEL_DIR),
+                            str(wav24), str(packets), "16"], check=True)
+        return {"name": path.stem, "input8": str(path), "packets": str(packets)}
+
+    def decoded(item, codec, value):
+        """Output at 8 kHz, aligned with the input."""
+        tag = f"{item['name']}_{threading.get_ident()}"
+        x8, _ = common.read_wav(item["input8"])
+        if codec == "mbe":
+            return mbe_decode(item, value, None, str(work), tag)[MBE_DELAY[value]:]
+        if codec == "lyra":
+            return down2(lyra_decode(resample_poly(x8, 2, 1).astype(np.float32), value, None))
+        out = work / f"{tag}.wav"
+        subprocess.run([str(TOOLS / "vocoscodec_decode.exe"), str(common.MODEL_DIR),
+                        item["packets"], str(out), "--codebooks", str(value)], check=True)
+        y24, _ = common.read_wav(out)
+        out.unlink()
+        return down2(common.down_24k_to_16k(y24))
+
+    def measure(task):
+        item, codec, value = task
+        x8, _ = common.read_wav(item["input8"])
+        y8 = decoded(item, codec, value)
+        n = min(len(x8), len(y8))
+        return {"pesq_nb": float(pesq(8000, x8[:n], y8[:n], "nb")),
+                "estoi": float(stoi(x8[:n], y8[:n], 8000, extended=True))}
+
+    codecs = [("vocoscodec", n) for n in (2, 3, 4, 6, 8, 12, 16)] + \
+             [("lyra", b) for b in (3200, 6000, 9200)] + [("mbe", r) for r in MBE_RATES]
+    with ThreadPoolExecutor(args.workers) as pool:
+        items = list(pool.map(prepared, files))
+        tasks = [(item, *codec) for codec in codecs for item in items]
+        scores = list(pool.map(measure, tasks))
+    table = {}
+    for i, codec in enumerate(codecs):
+        table[codec] = scores[i * len(items):(i + 1) * len(items)]
+    (OUT / "osr.json").write_text(json.dumps(
+        [{"codec": c, "value": v, "files": [{"file": it["name"], **r}
+                                            for it, r in zip(items, table[(c, v)])]}
+         for c, v in codecs], indent=1))
+
+    def rate_of(codec, value):
+        return MBE_RATES[value][0] if codec == "mbe" else value if codec == "lyra" else 750 * value
+
+    print(f"{len(items)} Open Speech Repository files, 8 kHz scoring")
+    print(f"{'codec':24} {'bit/s':>6}  PESQ   ESTOI")
+    for codec, value in sorted(codecs, key=lambda c: rate_of(*c)):
+        rows = table[(codec, value)]
+        print(f"{codec + ' ' + str(value):24} {rate_of(codec, value):6d}  "
+              f"{np.mean([r['pesq_nb'] for r in rows]):.2f}   "
+              f"{np.mean([r['estoi'] for r in rows]):.3f}")
+    print("\npaired differences: mean +- standard error, files won of "
+          f"{len(items)}, Wilcoxon p")
+    pairs = [(("vocoscodec", 3), ("mbe", "ambe2450")), (("vocoscodec", 3), ("mbe", "dstar")),
+             (("vocoscodec", 4), ("mbe", "ambe2450")), (("vocoscodec", 4), ("mbe", "dstar")),
+             (("vocoscodec", 4), ("mbe", "imbe4400")), (("vocoscodec", 6), ("mbe", "imbe4400")),
+             (("vocoscodec", 3), ("lyra", 3200)), (("vocoscodec", 4), ("lyra", 3200)),
+             (("vocoscodec", 8), ("lyra", 6000)), (("vocoscodec", 12), ("lyra", 9200)),
+             (("vocoscodec", 16), ("lyra", 9200))]
+    for a, b in pairs:
+        for key in ("pesq_nb", "estoi"):
+            d = np.array([x[key] - y[key] for x, y in zip(table[a], table[b])])
+            print(f"{a[0]} {a[1]} - {b[0]} {b[1]}: {key:7} {d.mean():+.3f} +- "
+                  f"{d.std(ddof=1) / np.sqrt(len(d)):.3f}, {int((d > 0).sum())}, "
+                  f"p={wilcoxon(d).pvalue:.3g}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -413,9 +648,14 @@ def main():
     sub.add_parser("bandwidth")
     sub.add_parser("lookahead")
     sub.add_parser("quality")
+    p = sub.add_parser("narrowband")
+    p.add_argument("--workers", type=int, default=6)
+    p = sub.add_parser("osr")
+    p.add_argument("--workers", type=int, default=6)
+    p.add_argument("--corpus", default=r"C:\Users\jon\source\repos\ambe\testdata\corpus")
     args = parser.parse_args()
     {"concealment": concealment, "bandwidth": bandwidth, "lookahead": lookahead,
-     "quality": quality}[args.command](args)
+     "quality": quality, "narrowband": narrowband, "osr": osr}[args.command](args)
 
 
 if __name__ == "__main__":
